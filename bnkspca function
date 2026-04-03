@@ -1,0 +1,274 @@
+def bnkspca(X, Y, q,
+            T=10000, burn_in=1000,
+            alpha_tau=1.0, beta_tau=1.0,
+            alpha_X=1.0, beta_X=1.0,
+            alpha_Y=1.0, beta_Y=1.0,
+            sigma2U=1,
+            init_seed=None,
+            verbose=True):
+
+    seed_base     = init_seed if init_seed is not None else \
+                    np.random.randint(0, 2**31)
+    rng = np.random.RandomState(seed_base)
+    rng_tilde = np.random.RandomState(seed_base + 384723084) 
+    n, p = X.shape
+    _, k = Y.shape
+
+
+    ### --- KNOCKOFF GENERATION WITH AND WITHOUT WHITENING --- ###    
+    Sigma = np.cov(X, rowvar=False)        
+    Sigma += 1e-9 * np.eye(p)
+    L_chol = np.linalg.cholesky(Sigma)       
+    L_inv  = np.linalg.solve(L_chol, np.eye(p))
+    X_white = X @ L_inv.T
+    X_white_tilde = generate_knockoffs(X_white, method='mvr')
+    Xtilde = X_white_tilde @ L_chol.T
+    std_X  = np.std(X,      axis=0)         
+    std_Xt = np.std(Xtilde, axis=0)         
+    Xtilde = Xtilde * (std_X / (std_Xt + 1e-10))
+    #Xtilde = generate_knockoffs(X, method='mvr') # No whitening, uses model-X knockoffs on original data
+
+
+    Xhat = np.hstack([X, Xtilde])   
+    p2 = 2 * p
+    X = Xhat[:, :p]
+    Xtilde = Xhat[:, p:]
+    scaler_Y = StandardScaler(with_mean=True, with_std=True)
+    Y = scaler_Y.fit_transform(Y)
+
+    ### --- PRIOR SPECIFICATION --- ###
+    Z = rng.normal(size=(n, q))  
+    U = rng.normal(scale=np.sqrt(sigma2U), size=(k, q)) 
+    alpha = rng.normal(size=p) 
+    alpha_tilde = rng_tilde.normal(size=p)  
+    lam = rng.normal(scale=1)  
+    lam_tilde = rng_tilde.normal(scale=1)  
+    tau2 = invgamma.rvs(a=alpha_tau, scale=beta_tau, random_state=rng)  
+    V = rng.normal(scale=np.sqrt(tau2), size=(p, q)) 
+    V_tilde = rng_tilde.normal(scale=np.sqrt(tau2), size=(p, q)) 
+    sigma2X = invgamma.rvs(a=alpha_X, scale=beta_X, random_state=rng)  
+    sigma2Y = invgamma.rvs(a=alpha_Y, scale=beta_Y, random_state=rng) 
+    def compute_W_from_alpha_v(alpha_vect, lam_loc, Vmat):
+        D = np.maximum(0.0, alpha_vect - lam_loc)[:, None]  
+        return D * Vmat 
+
+    W = compute_W_from_alpha_v(alpha, lam, V)  
+    W_tilde = compute_W_from_alpha_v(alpha_tilde, lam_tilde, V_tilde)
+    store = {
+        'alpha': [], 'alpha_tilde': [],
+        'lambda': [], 'lambda_tilde': [],
+        'tau2': [], 'sigma2X': [], 'sigma2Y': [],
+        'U': [], 'Z': [], 'W': [], 'W_tilde': [],
+        'V': [], 'V_tilde': []
+    }
+
+    ### --- GIBBS SAMPLER --- ###
+    itr_range = trange(T) if verbose else range(T)
+    for t in itr_range:
+        What = np.vstack([W, W_tilde])  
+        A = np.eye(q) + (What.T @ What) / sigma2X + (U.T @ U) / sigma2Y 
+        Sigma_Z = inv(A)
+        M1 = (What.T @ Xhat.T) / sigma2X
+        M2 = (U.T @ Y.T) / sigma2Y
+        MuZ_all = Sigma_Z @ (M1 + M2) 
+        Z = np.zeros((n, q))
+        L_Z = np.linalg.cholesky(Sigma_Z)
+        Z = MuZ_all.T + rng.normal(size=(n, q)) @ L_Z.T
+
+        ZTZ = Z.T @ Z 
+        Sigma_U = inv((ZTZ / sigma2Y) + (np.eye(q) / sigma2U))
+        MuU = Sigma_U @ ((Z.T @ Y) / sigma2Y)  
+        U = np.zeros((k, q))
+        L_U = np.linalg.cholesky(Sigma_U)
+        U = MuU.T + rng.normal(size=(k, q)) @ L_U.T
+        
+        R = Xhat - (Z @ What.T) 
+        ssqX = 0.5 * np.sum(R ** 2)
+        sigma2X = invgamma.rvs(a=alpha_X + 0.5 * n * p2, scale=beta_X + ssqX, random_state=rng)
+        RY = Y - (Z @ U.T)
+        ssqY = 0.5 * np.sum(RY ** 2)
+        sigma2Y = invgamma.rvs(a=alpha_Y + 0.5 * n * k, scale=beta_Y + ssqY, random_state=rng)
+
+        ### --- GROUP SHIFT --- ###
+        delta = rng.normal(loc=(np.dot(alpha,alpha) + lam)/(p + 1.0),
+                   scale=np.sqrt(1.0/(p + 1.0)))
+        alpha +=  delta
+        lam += delta  
+        lam = np.clip(lam, -2.0, 2.0)
+        delta_tilde = rng_tilde.normal(loc=(np.dot(alpha_tilde,alpha_tilde) + lam_tilde)/(p + 1.0),
+                   scale=np.sqrt(1.0/(p + 1.0)))
+        alpha_tilde +=  delta_tilde
+        lam_tilde += delta_tilde  
+        lam_tilde = np.clip(lam_tilde, -2.0, 2.0)
+
+        # Sample original variables
+        for j in range(p):
+            Rj = X[:, j]
+            vj = V[j, :]
+            Zv = Z @ vj 
+            norm2_Zv = np.sum(Zv ** 2)
+            numerator = np.dot(Rj + lam * Zv, Zv)  
+            denominator = norm2_Zv + sigma2X
+            alpha_hat_j = numerator / denominator
+            sigma_hat_j2 = sigma2X / denominator
+            sigma_hat_j = np.sqrt(max(sigma_hat_j2, 1e-12))
+
+            # Use of log scale for numerical stability
+            log_term1 = (norm.logcdf(lam) - np.sum(Rj ** 2) / (2.0 * sigma2X))
+
+            log_term2 = (np.log(max(sigma_hat_j, 1e-300)) + norm.logcdf(-(lam - alpha_hat_j) / sigma_hat_j)
+                          + alpha_hat_j ** 2 / (2.0 * sigma_hat_j2)- np.sum((Rj + lam * Zv) ** 2) / (2.0 * sigma2X))
+
+            log_denom = np.logaddexp(log_term1, log_term2)
+            kappa = np.exp(log_term1 - log_denom)
+
+            if rng.rand() < kappa:
+                alpha[j] = sample_truncnorm(mu=0.0, sigma=1, a=-np.inf, b=lam, size=None)
+            else:
+                alpha[j] = sample_truncnorm(mu=alpha_hat_j, sigma=sigma_hat_j, a=lam, b=np.inf, size=None)
+
+           
+            if alpha[j] < lam:
+                V[j, :] = rng.normal(scale=np.sqrt(tau2), size=(q,))
+            else:
+                Dj = alpha[j] - lam 
+                A = (Dj**2 * ZTZ / sigma2X) + (np.eye(q) / tau2) + 1e-8 * np.eye(q)  
+                Sigma_vj = np.linalg.inv(A)
+                b = (Dj * (Z.T @ X[:, j])) / sigma2X
+                mu_vj = Sigma_vj @ b
+                L = np.linalg.cholesky(Sigma_vj)
+                rand_vec = rng.normal(size=q)
+                V[j, :] = mu_vj + L @ rand_vec
+
+        # Sample knockoff variables
+        for idx in range(p):
+            j = p + idx
+            Rj_tilde = Xtilde[:, idx]
+            vj_tilde = V_tilde[idx, :]
+            Zv = Z @ vj_tilde 
+            norm2_Zv = np.sum(Zv ** 2)
+            numerator_tilde = np.dot(Rj_tilde + lam_tilde * Zv, Zv)
+            denominator_tilde = norm2_Zv + sigma2X
+            alpha_hat_j_tilde = numerator_tilde / denominator_tilde
+            sigma_hat_j2_tilde = sigma2X / denominator_tilde
+            sigma_hat_j_tilde = np.sqrt(max(sigma_hat_j2_tilde, 1e-12))
+        
+            log_term1_tilde = (norm.logcdf(lam_tilde) - np.sum(Rj_tilde ** 2) / (2.0 * sigma2X))
+
+            log_term2_tilde = (np.log(max(sigma_hat_j_tilde, 1e-300)) + norm.logcdf(-(lam_tilde - alpha_hat_j_tilde) / sigma_hat_j_tilde)
+                          + alpha_hat_j_tilde ** 2 / (2.0 * sigma_hat_j2_tilde)- np.sum((Rj_tilde + lam_tilde * Zv) ** 2) / (2.0 * sigma2X))
+            
+           
+            log_denom_tilde = np.logaddexp(log_term1_tilde, log_term2_tilde)
+            kappa_tilde = np.exp(log_term1_tilde - log_denom_tilde)
+
+            if rng_tilde.rand() < kappa_tilde:
+                alpha_tilde[idx] = sample_truncnorm(mu=0.0, sigma=1, a=-np.inf, b=lam_tilde, size=None)
+            else:
+                alpha_tilde[idx] = sample_truncnorm(mu=alpha_hat_j_tilde, sigma=sigma_hat_j_tilde, a=lam_tilde, b=np.inf, size=None)
+
+
+
+
+            if alpha_tilde[idx] < lam_tilde:
+                V_tilde[idx, :] = rng_tilde.normal(scale=np.sqrt(tau2), size=(q,))
+            else:
+                Dj = alpha_tilde[idx] - lam_tilde
+                A = (Dj**2 * ZTZ / sigma2X) + (np.eye(q) / tau2) + 1e-8 * np.eye(q) 
+                Sigma_vj = np.linalg.inv(A)
+                b = (Dj * (Z.T @ Xtilde[:, idx])) / sigma2X
+                mu_vj = Sigma_vj @ b
+                L = np.linalg.cholesky(Sigma_vj)
+                rand_vec = rng_tilde.normal(size=q)
+                V_tilde[idx, :] = mu_vj + L @ rand_vec
+
+        
+        sum_vsq1 = 0.5 * np.sum(V**2) + 0.5 * np.sum(V_tilde**2)
+        tau2 = invgamma.rvs(a=alpha_tau + p * q, scale=beta_tau + sum_vsq1, random_state=rng) 
+        #tau2_tilde = invgamma.rvs(a=alpha_tau_tilde + p * q, scale=beta_tau_tilde + sum_vsq2, random_state=rng_tilde) 
+        W = compute_W_from_alpha_v(alpha, lam, V)
+        W_tilde = compute_W_from_alpha_v(alpha_tilde, lam_tilde, V_tilde)
+
+        if t >= burn_in:
+            store['alpha'].append(alpha.copy())
+            store['alpha_tilde'].append(alpha_tilde.copy())
+            store['lambda'].append(lam)
+            store['lambda_tilde'].append(lam_tilde)
+            store['tau2'].append(tau2)
+            store['sigma2X'].append(sigma2X)
+            store['sigma2Y'].append(sigma2Y)
+            store['U'].append(U.copy())
+            store['W'].append(W.copy())
+            store['W_tilde'].append(W_tilde.copy())
+            store['Z'].append(Z.copy())
+            store['V'].append(V.copy())
+            store['V_tilde'].append(V_tilde.copy())
+
+    ### --- CALCUALTE KNOCKOFF STATISTIC WITH FLIP-SIGN PROPERTY --- ###
+    for k in list(store.keys()):
+        store[k] = np.array(store[k], dtype=object) if k in ('W', 'W_tilde', 'Z', 'U', 'alpha', 'alpha_tilde') else np.array(store[k])
+    npost = store['alpha'].shape[0]
+    act_mask = np.array([ (store['alpha'][s] > store['lambda'][s]) for s in range(npost) ])
+    PIP = act_mask.mean(axis=0)
+    act_mask_tilde = np.array([ (store['alpha_tilde'][s] > store['lambda_tilde'][s]) for s in range(npost) ])
+    PIP_tilde = act_mask_tilde.mean(axis=0)
+    Q = np(PIP) - np(PIP_tilde)
+    #Q = np.maximum(PIP, PIP_tilde) * np.sign(PIP - PIP_tilde)
+    #epsilon = 1e-6
+    #Q = np.log((PIP + epsilon) / (PIP_tilde + epsilon))
+    print("Top Q:", np.sort(Q)[-10:])
+    print("Bottom Q:", np.sort(Q)[:10])
+    
+    ### --- THRESHOLD RULE --- ###
+    # +1 on the numerator allows for exact FDR control (knockoff+), alternatively omitting it controls the modified FDR (less-conservative)
+    def knockoff_threshold(Q_vals, psi=0.2):
+        abs_vals = np.unique(np.abs(Q_vals))
+        if abs_vals.size == 0:
+            if verbose:
+                print(f"[Knockoff] No nonzero statistics. Nothing selected (ψ={psi}).")
+            return 0.0, np.array([], dtype=int)
+
+        best_tau     = None
+        best_selected = np.array([], dtype=int)
+        best_n       = 0
+
+        for tau in abs_vals:
+            num_neg = np.sum(Q_vals <= -tau)
+            num_pos = np.sum(Q_vals >=  tau)
+            fdr_hat =  (1 + num_neg ) / max(1, num_pos)   # knockoff+
+            #fdr_hat =   num_neg  / max(1, num_pos)   # controls modified FDR
+            if fdr_hat <= psi:
+                n_sel = num_pos
+                if n_sel > best_n:
+                    best_n        = n_sel
+                    best_tau      = tau
+                    best_selected = np.where(Q_vals >= tau)[0]
+                    best_fdr      = fdr_hat
+
+        if best_tau is not None:
+            if verbose:
+                print(f"[Knockoff] ψ={psi:.2f}: τ={best_tau:.4f}, "
+                      f"selected {len(best_selected)} features "
+                      f"(FDR≈{best_fdr:.3f}).")
+            return best_tau, best_selected
+
+        if verbose:
+            print(f"[Knockoff] No τ satisfied FDR ≤ {psi}. Nothing selected.")
+        return np.min(abs_vals), np.array([], dtype=int)
+
+    tau_hat, selected = knockoff_threshold(Q, psi=0.2)
+
+    results = {
+        'store': store,
+        'PIP': PIP,
+        'PIP_tilde': PIP_tilde,
+        'Q': Q,
+        'tau_hat': tau_hat,
+        'selected': selected,
+        'parameters': {
+            'sigma2X': sigma2X,
+            'sigma2Y': sigma2Y,
+            'tau2': tau2
+        }
+    }
+    return results
