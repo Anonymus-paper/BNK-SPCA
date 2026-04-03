@@ -1,0 +1,21 @@
+def generate_knockoffs(X, method='mvr'):
+    n, p = X.shape
+    mu = np.mean(X, axis=0)
+    
+    Sigma = GraphicalLassoCV().fit(X).covariance_
+    Sigma += 1e-8 * np.eye(p)
+
+    try:
+        sampler = GaussianSampler(
+            X=X,
+            Sigma=Sigma,
+            mu=np.zeros(p),
+            method=method 
+        )
+        
+        X_tilde = sampler.sample_knockoffs() + mu
+        return X_tilde
+        
+    except ValueError as e:
+        Sigma += 1e-4 * np.eye(p)
+        return X_tilde
