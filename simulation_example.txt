@@ -1,0 +1,173 @@
+import numpy as np
+import pandas as pd
+import pickle
+from joblib import Parallel, delayed
+import multiprocessing
+import warnings
+warnings.filterwarnings("ignore")
+
+def count_nonzero_vars(W, tol=1e-6):
+    return np.sum(np.linalg.norm(W, axis=1) > tol)
+
+def run_one_sim(sim):
+
+    print(f"[Simulation {sim}] START")
+    n = 1000
+    p = 500
+    k = 2
+    sigma_noise = 1
+    rho = 0.4
+    kappa = 0.4
+
+    X = np.zeros((n, p))
+    X[:, 0] = np.random.normal(size=n)
+
+    for j in range(1, p):
+      X[:, j] = kappa * X[:, j-1] + np.sqrt(1 - kappa**2) * np.random.normal(size=n)
+
+    beta_true = np.zeros((p, k))
+    beta_true[:10] = np.random.normal(loc=0, scale=1, size=(10, k))
+    Sigma = np.array([[sigma_noise**2, rho * sigma_noise**2],
+                  [rho * sigma_noise**2, sigma_noise**2]])
+
+    true_active = np.arange(10)  
+    #noise = np.random.normal(scale=sigma_noise, size=(n, k))
+    noise = np.random.multivariate_normal(mean=np.zeros(k), cov=Sigma, size=n)
+    Y = X @ beta_true + noise
+
+    results = []
+
+    # BSPLS
+    options = {
+        'cyc': 100, 'tol': 0.001, 'k': 2,
+        'initialisation': 'random', 'adaptive': 1,
+        'pcaX': 1, 'pcaY': 0
+    }
+    model_pls = plsinit(X, Y, options)
+    model_pls, _ = plsvbinference(X, Y, model=model_pls, verbose=False)
+
+    P_original = model_pls['P']['Mu_P']
+    selected_idx = np.where(np.linalg.norm(P_original, axis=1) > 1e-2)[0]
+
+    selected = len(selected_idx)
+    tp = len(np.intersect1d(selected_idx, true_active))
+    fp = selected - tp
+    fdr = fp / max(1, selected)
+
+    results.append({
+        "Simulation": sim,
+        "Method": "PLS Variational Bayes",
+        "Nonzero": selected,
+        "TPR": tp,
+        "FPR": fp,
+        "FDR": fdr,
+        "Power": tp / len(true_active)
+    })
+
+
+    #BNK-SPCA
+    res = bnkspca(
+        X, Y, q=2, T=5000, burn_in=500,
+        init_seed=None, verbose=False
+    )
+    selected = res["selected"]
+    print(selected)
+
+    num_selected = len(selected)
+    tp = len(np.intersect1d(selected, true_active))
+    fp = num_selected - tp
+    fdr = fp / max(1, num_selected)
+
+    results.append({
+        "Simulation": sim,
+        "Method": "Neuronized Knockoff PCA",
+        "Nonzero": num_selected,
+        "TPR": tp,
+        "FPR": fp,
+        "FDR": fdr,
+        "Power": tp / len(true_active)
+    })
+
+
+    # SSPCA
+    res_sspca = sspca(X, Y, K=2, c=2, standardize=False)
+    V = res_sspca["V"]
+    selected = np.where(np.linalg.norm(V, axis=1) > 1e-2)[0]
+
+    num_selected_sspca = len(selected)
+    tp = len(np.intersect1d(selected, true_active))
+    fp = num_selected_sspca - tp
+    fdr = fp / max(1, num_selected_sspca)
+
+    results.append({
+        "Simulation": sim,
+        "Method": "Sparse Supervised PCA",
+        "Nonzero": num_selected_sspca,
+        "TPR": tp,
+        "FPR": fp,
+        "FDR": fdr,
+        "Power": tp / len(true_active)
+    })
+
+
+    # Spike-Slab PCA
+    res_vb = VBsparsePCA(
+        X, r=2, lambda_=0.01, slab_prior="MVN", max_iter=100, eps=1e-3,
+        jointly_row_sparse=False, center_scale=False, threshold=0.1,
+        kappa_para1=1, kappa_para2=9, sigma_a=1, sigma_b=2
+    )
+    selection = np.where(res_vb['selection'] > 0)[0]
+
+    num_selected_pca = len(selection)
+    tp = len(np.intersect1d(selection, true_active))
+    fp = num_selected_pca - tp
+    fdr = fp / max(1, num_selected_pca)
+
+    results.append({
+        "Simulation": sim,
+        "Method": "VB Sparse PCA",
+        "Nonzero": num_selected_pca,
+        "TPR": tp,
+        "FPR": fp,
+        "FDR": fdr,
+        "Power": tp / len(true_active)
+    })
+
+
+    print(f"[Simulation {sim}] DONE")
+    return results
+
+
+if __name__ == "__main__":
+
+    N_SIM = 100
+    N_JOBS = 10
+    print(f"Running {N_SIM} simulations on {N_JOBS} CPU cores...")
+
+    results_nested = Parallel(n_jobs=N_JOBS, verbose=10)(
+        delayed(run_one_sim)(sim) for sim in range(N_SIM)
+    )
+
+    results = [item for sub in results_nested for item in sub]
+    with open("results_raw.pkl", "wb") as f:
+        pickle.dump(results, f)
+
+    df = pd.DataFrame(results)
+
+    summary = df.groupby("Method", as_index=False).agg(
+        Mean_Nonzero=("Nonzero", "mean"),
+        SD_Nonzero=("Nonzero", "std"),
+        Mean_FDR=("FDR", "mean"),
+        SD_FDR=("FDR", "std"),
+        Mean_TPR=("TPR", "mean"),
+        SD_TPR=("TPR", "std"),
+        Mean_FPR=("FPR", "mean"),
+        SD_FPR=("FPR", "std"),
+        Mean_Power=("Power", "mean"),
+        SD_Power=("Power", "std")
+    )
+
+    summary.to_csv("results_summary.csv", index=False)
+
+    print("\n=== DONE ===")
+    print(summary)
