@@ -80,15 +80,15 @@ def bnkspca(X, Y, q,
         M2 = (U.T @ Y.T) / sigma2Y
         MuZ_all = Sigma_Z @ (M1 + M2) 
         Z = np.zeros((n, q))
-        L_Z = np.linalg.cholesky(Sigma_Z)
-        Z = MuZ_all.T + rng.normal(size=(n, q)) @ L_Z.T
+        for i in range(n):
+          Z[i, :] = rng.multivariate_normal(mean=MuZ_all[:, i], cov=Sigma_Z)
 
         ZTZ = Z.T @ Z 
         Sigma_U = inv((ZTZ / sigma2Y) + (np.eye(q) / sigma2U))
         MuU = Sigma_U @ ((Z.T @ Y) / sigma2Y)  
         U = np.zeros((k, q))
-        L_U = np.linalg.cholesky(Sigma_U)
-        U = MuU.T + rng.normal(size=(k, q)) @ L_U.T
+        for i in range(k):
+          U[i, :] = rng.multivariate_normal(mean=MuU[:, i], cov=Sigma_U)
         
         R = Xhat - (Z @ What.T) 
         ssqX = 0.5 * np.sum(R ** 2)
@@ -121,20 +121,15 @@ def bnkspca(X, Y, q,
             sigma_hat_j2 = sigma2X / denominator
             sigma_hat_j = np.sqrt(max(sigma_hat_j2, 1e-12))
 
-            # Use of log scale for numerical stability
-            log_term1 = (norm.logcdf(lam) - np.sum(Rj ** 2) / (2.0 * sigma2X))
-
-            log_term2 = (np.log(max(sigma_hat_j, 1e-300)) + norm.logcdf(-(lam - alpha_hat_j) / sigma_hat_j)
-                          + alpha_hat_j ** 2 / (2.0 * sigma_hat_j2)- np.sum((Rj + lam * Zv) ** 2) / (2.0 * sigma2X))
-
-            log_denom = np.logaddexp(log_term1, log_term2)
-            kappa = np.exp(log_term1 - log_denom)
+            term1 = norm.cdf(lam) * np.exp(-np.sum(Rj ** 2) / (2 * sigma2X))
+            std_val = (lam - alpha_hat_j) / sigma_hat_j
+            term2 = (1 - norm.cdf(std_val)) * sigma_hat_j * np.exp((alpha_hat_j ** 2) / (2 * sigma_hat_j2)- np.sum((Rj + lam * Zv) ** 2) / (2 * sigma2X))
+            kappa = term1 / (term1 + term2)
 
             if rng.rand() < kappa:
                 alpha[j] = sample_truncnorm(mu=0.0, sigma=1, a=-np.inf, b=lam, size=None)
             else:
                 alpha[j] = sample_truncnorm(mu=alpha_hat_j, sigma=sigma_hat_j, a=lam, b=np.inf, size=None)
-
            
             if alpha[j] < lam:
                 V[j, :] = rng.normal(scale=np.sqrt(tau2), size=(q,))
@@ -161,14 +156,10 @@ def bnkspca(X, Y, q,
             sigma_hat_j2_tilde = sigma2X / denominator_tilde
             sigma_hat_j_tilde = np.sqrt(max(sigma_hat_j2_tilde, 1e-12))
         
-            log_term1_tilde = (norm.logcdf(lam_tilde) - np.sum(Rj_tilde ** 2) / (2.0 * sigma2X))
-
-            log_term2_tilde = (np.log(max(sigma_hat_j_tilde, 1e-300)) + norm.logcdf(-(lam_tilde - alpha_hat_j_tilde) / sigma_hat_j_tilde)
-                          + alpha_hat_j_tilde ** 2 / (2.0 * sigma_hat_j2_tilde)- np.sum((Rj_tilde + lam_tilde * Zv) ** 2) / (2.0 * sigma2X))
-            
-           
-            log_denom_tilde = np.logaddexp(log_term1_tilde, log_term2_tilde)
-            kappa_tilde = np.exp(log_term1_tilde - log_denom_tilde)
+            term1_tilde = norm.cdf(lam_tilde) * np.exp(-np.sum(Rj_tilde ** 2) / (2 * sigma2X))
+            std_val_tilde = (lam_tilde - alpha_hat_j_tilde) / sigma_hat_j_tilde
+            term2_tilde = (1 - norm.cdf(std_val_tilde)) * sigma_hat_j_tilde * np.exp((alpha_hat_j_tilde ** 2) / (2 * sigma_hat_j2_tilde)   - np.sum((Rj_tilde + lam_tilde * Zv) ** 2) / (2 * sigma2X))
+            kappa_tilde = term1_tilde / (term1_tilde + term2_tilde) 
 
             if rng_tilde.rand() < kappa_tilde:
                 alpha_tilde[idx] = sample_truncnorm(mu=0.0, sigma=1, a=-np.inf, b=lam_tilde, size=None)
