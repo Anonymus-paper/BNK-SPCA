@@ -28,6 +28,14 @@ def bnkspca(X, Y, q,
     Xtilde = Xtilde * (std_X / (std_Xt + 1e-10))
     #Xtilde = generate_knockoffs(X, method='mvr') # No whitening, uses model-X knockoffs on original data
 
+    # If Cholesky-whitening fails, SVD-whitening is more stable, especially for p>n.
+    #U, S, Vt = np.linalg.svd(Sigma)
+    #S_inv_sqrt = np.diag(1.0 / np.sqrt(S + 1e-10))
+    #Sigma_inv_sqrt = U @ S_inv_sqrt @ U.T
+    #X_white = X @ Sigma_inv_sqrt
+    #X_white_tilde = generate_knockoffs(X_white, method='mvr')
+    #Sigma_sqrt = U @ np.diag(np.sqrt(S + 1e-10)) @ U.T
+    #Xtilde = X_white_tilde @ Sigma_sqrt
 
     Xhat = np.hstack([X, Xtilde])   
     p2 = 2 * p
