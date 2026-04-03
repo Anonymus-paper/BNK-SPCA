@@ -19,6 +19,7 @@ def run_one_sim(sim):
     rho = 0.4
     kappa = 0.4
 
+    # AR(1) correlation structure for X
     X = np.zeros((n, p))
     X[:, 0] = np.random.normal(size=n)
 
@@ -27,11 +28,11 @@ def run_one_sim(sim):
 
     beta_true = np.zeros((p, k))
     beta_true[:10] = np.random.normal(loc=0, scale=1, size=(10, k))
+    # Introduce response dependence
     Sigma = np.array([[sigma_noise**2, rho * sigma_noise**2],
                   [rho * sigma_noise**2, sigma_noise**2]])
 
     true_active = np.arange(10)  
-    #noise = np.random.normal(scale=sigma_noise, size=(n, k))
     noise = np.random.multivariate_normal(mean=np.zeros(k), cov=Sigma, size=n)
     Y = X @ beta_true + noise
 
